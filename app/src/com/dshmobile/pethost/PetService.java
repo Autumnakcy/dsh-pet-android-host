@@ -70,11 +70,13 @@ public class PetService extends Service {
 
     private static final String TAG = "PetHost";
     /** 打进 /report 里，用来确认手机装的是哪一版 */
-    private static final String APP_VER = "6.6";
+    private static final String APP_VER = "6.8";
     /** 页面静默多久就 reload / 重建窗口（2.8 的同款阈值，实测能区分"发呆"和"渲染进程死了"） */
     private static final long SILENT_RELOAD_MS = 60000;
     private static final long SILENT_RECREATE_MS = 180000;
     private static final long WATCH_MS = 4000;
+    /** 宿主侧存活探测的间隔（v6.7）：不依赖页面定时器，所以不怕节流 */
+    private static final long PING_MS = 8000;
     private static volatile boolean running = false;
 
     private WindowManager wm;
@@ -105,8 +107,11 @@ public class PetService extends Service {
     private volatile String lastJsInfo = "";
     private volatile String lastError = "";
     private volatile long pageLoads = 0;
-    /** 页面最后一次"我还活着"的时间（心跳 / 桥调用）。看门狗只看它。 */
+    /** 页面最后一次"我还活着"的时间（宿主 ping / 页面心跳 / 桥调用）。看门狗只看它。 */
     private volatile long lastPageAliveAt = 0;
+    /** 宿主 ping 最近一次成功的时间与次数（/dump 里能看到，区分"她安静"和"真死了"） */
+    private volatile long pingOkAt = 0;
+    private volatile int pingN = 0;
     /** 模式 A 自检代数：每进一次 A 加一，防止旧的定时器误判新的窗口 */
     private volatile int a11yGen = 0;
     /** 建窗代数：老窗口留下的延时任务（"触摸区没回调就自杀"）必须失效 */
@@ -302,9 +307,45 @@ public class PetService extends Service {
         startForeground(1, notification());
         main.post(this::createWindows);
         startWatchdog();
+        armPagePing();
         new Thread(this::loopStatus, "pet-status").start();
         new Thread(new DebugServer(), "pet-debug").start();
         new Thread(this::tuneLoop, "pet-tune").start();
+    }
+
+    /**
+     * 页面存活探测（宿主侧，v6.7）。
+     *
+     * 为什么不再只信页面里的心跳：页面那边是 `setInterval(beat, 5000)`，实测会被拖慢/停掉
+     * （真机日志里见过连续 12 次「silent 60s -> reload page」，也就是每 60 秒白白重载一次页面 ——
+     *  重载瞬间旧画面还在、新页面还没画出来，用户看到的就是「有时会有两个她」「有时半透明」）。
+     * `evaluateJavascript` 的回调由宿主侧触发，只要 JS 引擎还能跑就会回来，不受页面定时器节流影响。
+     */
+    private void armPagePing() {
+        main.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!running) return;
+                pingPage();
+                main.postDelayed(this, PING_MS);
+            }
+        }, PING_MS);
+    }
+
+    private void pingPage() {
+        final WebView w = web;
+        if (w == null) return;
+        try {
+            w.evaluateJavascript("1", value -> {
+                if (w == web) {
+                    long now = System.currentTimeMillis();
+                    pingOkAt = now;
+                    pingN++;
+                    lastPageAliveAt = now;
+                }
+            });
+        } catch (Throwable ignore) {
+        }
     }
 
     private int dimen(String name) {
@@ -630,6 +671,13 @@ public class PetService extends Service {
                 try {
                     if (!running) return;
                     long now = System.currentTimeMillis();
+                    // 屏幕关着的时候她本来就看不见，WebView 也可能被系统挂起 —— 这时候去 reload
+                    // 只会白白重建页面（回来时正好撞上"旧画面还在、新页面还没画"的那一刻）。
+                    if (!screenOn()) {
+                        if (lastPageAliveAt > 0) lastPageAliveAt = now;
+                        main.postDelayed(this, WATCH_MS);
+                        return;
+                    }
                     if (lastPageAliveAt > 0) {
                         long silent = now - lastPageAliveAt;
                         if (silent > SILENT_RECREATE_MS) {
@@ -766,15 +814,51 @@ public class PetService extends Service {
     }
 
     /** 同步摘窗（removeView 是异步的，紧接着 addView 会报"已经加过了"）。 */
+    /**
+     * 同步摘窗（removeView 是异步的，紧接着 addView 会报"已经加过了"）。
+     *
+     * v6.7：不能只用"当前那个 WindowManager"。模式 A↔B 切换、或无障碍服务被系统杀掉时，
+     * 「这块窗当初是谁加的」和「现在手上的 wm 是谁」可能不是同一个 —— 摘不掉就会在屏幕上
+     * 留下一块旧画面的全屏窗，用户看到的就是「有时候有两个她」/「有时候发虚」。
+     * 所以三个都试一遍：当前 wm、无障碍 wm、系统 wm。
+     */
     private void removeNow(View v) {
         if (v == null) return;
-        try {
-            wm.removeViewImmediate(v);
-        } catch (Throwable ignore) {
+        WindowManager[] list = new WindowManager[]{
+                wm, safeA11yWm(), (WindowManager) getSystemService(Context.WINDOW_SERVICE)
+        };
+        for (WindowManager m : list) {
+            if (m == null) continue;
             try {
-                wm.removeView(v);
-            } catch (Throwable ignore2) {
+                m.removeViewImmediate(v);
+                return;
+            } catch (Throwable ignore) {
             }
+            try {
+                m.removeView(v);
+                return;
+            } catch (Throwable ignore) {
+            }
+        }
+        log("removeNow: 三个 WindowManager 都摘不掉这块窗（旧的可能还留在屏幕上）");
+    }
+
+    /** 屏幕是不是亮着（熄屏时不做页面健康检查 / 不重载）。 */
+    private boolean screenOn() {
+        try {
+            android.os.PowerManager pm =
+                    (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+            return pm == null || pm.isInteractive();
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    private WindowManager safeA11yWm() {
+        try {
+            return PetA11y.wm();
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -835,6 +919,7 @@ public class PetService extends Service {
 
     private void createWindows() {
         winGen++;
+        log("createWindows gen=" + winGen + " a11y=" + a11yOn + " area=" + areaW + "x" + areaH + "@" + areaTop);
         try {
             int type = a11yOn
                     ? WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
@@ -1846,6 +1931,8 @@ public class PetService extends Service {
             o.put("areaTop", areaTop);
             o.put("areaH", areaH);
             o.put("areaW", areaW);
+            o.put("pingN", pingN);
+            o.put("pingAgoMs", pingOkAt == 0 ? -1 : (System.currentTimeMillis() - pingOkAt));
             o.put("rotated", areaW > areaH ? "landscape" : "portrait");
             o.put("pageLoads", pageLoads);
             o.put("shimFrom", shimFrom);

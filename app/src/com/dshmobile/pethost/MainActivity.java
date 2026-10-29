@@ -47,7 +47,6 @@ public class MainActivity extends Activity {
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView chipPerm, chipWindow, chipLink;
-    private TextView bootInfo;
     private android.widget.Switch bootSwitch;
     private TextView shotInfo;
     private TextView primary, secondary;
@@ -140,17 +139,11 @@ public class MainActivity extends Activity {
         bootSwitch.setChecked(Boot.enabled(this));
         bootSwitch.setOnCheckedChangeListener((v, on) -> {
             Boot.set(this, on);
-            bootInfo.setText(on ? "已打开：重启后人家会自己回来（前提是系统自启动权限也给了）"
-                    : "已关闭：重启后不会自动出现，要看人家就点上面的「打开悬浮窗」");
+            toast(on ? "已打开：重启后会自动出现" : "已关闭：重启后不会自动出现");
         });
         bootRow.addView(bootSwitch);
         bootCard.addView(bootRow);
 
-        bootInfo = text(Boot.enabled(this)
-                ? "开机时由本 App 自己把她拉起来；ColorOS 那层「自启动」没给的话，广播收不到。"
-                : "开机自动启动当前是关的。", 11, MUTED, false);
-        bootInfo.setPadding(0, dp(8), 0, 0);
-        bootCard.addView(bootInfo);
 
         TextView bootBtn = ghostButton("打开系统自启动权限");
         bootBtn.setOnClickListener(v -> openAutostart());
@@ -236,7 +229,7 @@ public class MainActivity extends Activity {
             }
         }
         if (hit != null) {
-            bootInfo.setText("已打开系统的自启动管理页；把「DSH 桌宠悬浮窗」打开就行（系统不提供读状态的接口，人家看不到它有没有真的开）");
+            toast("已打开系统自启动管理页，把「DSH 桌宠悬浮窗」打开");
             final String tag = hit[0] + "/" + hit[1];
             new Thread(() -> ping("autostart page " + tag)).start();
             return;
@@ -247,10 +240,10 @@ public class MainActivity extends Activity {
                     Uri.parse("package:" + getPackageName()));
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(i);
-            bootInfo.setText("没找到自启动管理页，已跳到「应用信息」：在里面找自启动 / 耗电管理");
+            toast("已跳到「应用信息」，在里面找自启动 / 耗电管理");
             new Thread(() -> ping("autostart fallback appinfo")).start();
         } catch (Throwable t) {
-            bootInfo.setText("打不开系统设置，请手动去：手机管家 → 应用自启动管理 → 打开「DSH 桌宠悬浮窗」");
+            toast("打不开系统设置，请手动去：手机管家 → 应用自启动管理");
             new Thread(() -> ping("autostart failed " + t)).start();
         }
     }
@@ -357,6 +350,13 @@ public class MainActivity extends Activity {
 
 
     // ---------------- 视觉小工具 ----------------
+
+    private void toast(String s) {
+        try {
+            android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Throwable ignore) {
+        }
+    }
 
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);

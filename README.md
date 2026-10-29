@@ -5,7 +5,7 @@
 这个仓库只做最难也最脏的那一层 —— **窗口、触摸、坐标**。
 
 - 包名 `com.dshmobile.pethost`
-- 版本 **6.6**（versionCode 41）
+- 版本 **6.8**（versionCode 43）
 - 无 Gradle、无第三方依赖，一个 `build.sh` 直接出 APK
 - 在 OxygenOS/ColorOS + Android 16 上验证
 
@@ -94,9 +94,3 @@ bash build.sh
 - `targetSdk 28` 时 `WindowInsets.getInsets()` 走 legacy 口径、**返回全 0**，别直接采信；
 - WebView 的 `::-webkit-media-controls-*` 伪元素必须**一条规则一条**写，逗号列表里有一个不识别，整条会被静默丢弃；
 - `element.textContent` 会把 `display:none` 的文字也算进去，判等要取标题那一段。
-
----
-
-## License
-
-[MIT](LICENSE) © 2026 Autumnakcy
