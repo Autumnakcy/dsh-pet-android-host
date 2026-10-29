@@ -5,7 +5,7 @@
 这个仓库只做最难也最脏的那一层 —— **窗口、触摸、坐标**。
 
 - 包名 `com.dshmobile.pethost`
-- 版本 **6.8**（versionCode 43）
+- 版本 **6.9**（versionCode 44）
 - 无 Gradle、无第三方依赖，一个 `build.sh` 直接出 APK
 - 在 OxygenOS/ColorOS + Android 16 上验证
 

@@ -69,8 +69,12 @@ import java.util.concurrent.TimeUnit;
 public class PetService extends Service {
 
     private static final String TAG = "PetHost";
+    /** 控制面板的「重启悬浮窗」：不 stop/start 服务，直接让**同一个实例**重建窗口。
+     *  以前是 stopService + startForegroundService 连发，两个请求抢同一个 ServiceRecord，
+     *  旧窗还没摘完新窗就建 —— 正是"关掉再打开就多一只"的来源之一。 */
+    static final String ACTION_RESTART = "com.dshmobile.pethost.action.RESTART";
     /** 打进 /report 里，用来确认手机装的是哪一版 */
-    private static final String APP_VER = "6.8";
+    private static final String APP_VER = "6.9";
     /** 页面静默多久就 reload / 重建窗口（2.8 的同款阈值，实测能区分"发呆"和"渲染进程死了"） */
     private static final long SILENT_RELOAD_MS = 60000;
     private static final long SILENT_RECREATE_MS = 180000;
@@ -563,8 +567,9 @@ public class PetService extends Service {
         if (web == null) return;
         winGen++;
         log("rebuild window format=" + winFormat + " hw=" + winHw + " va=" + winViewAlpha + " layer=" + winLayer);
-        removeNow(web);
-        removeNow(touch);
+        detachWindow(web);   // 只摘不销毁：这块 WebView 马上要重新挂回窗口
+        detachWindow(touch);
+        detachWindow(probeView);
         try {
             int type = winTypeInt();
             int f;
@@ -615,7 +620,7 @@ public class PetService extends Service {
             applyViewParams();
             setTrustedFlag(lpRender, winTrusted);
             try {
-                wm.addView(web, lpRender);
+                addLiveWindow(web, lpRender);
                 installTouchRegion();
             } catch (Throwable boom) {
                 log("addView failed (" + winType + "/" + winFlagSet + "): " + boom);
@@ -638,7 +643,7 @@ public class PetService extends Service {
                 lpRender.y = areaTop;
                 lpRender.alpha = (float) winWinAlpha;
                 lpRender.windowAnimations = 0;
-                wm.addView(web, lpRender);
+                addLiveWindow(web, lpRender);
             }
 
             int tf = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -649,7 +654,7 @@ public class PetService extends Service {
             lpTouch = new WindowManager.LayoutParams(1, 1, lpRender.type, tf, PixelFormat.TRANSLUCENT);
             lpTouch.gravity = Gravity.TOP | Gravity.LEFT;
             setTrustedFlag(lpTouch, winTrusted);
-            wm.addView(touch, lpTouch);
+            addLiveWindow(touch, lpTouch);
             actValid = false;
             syncProbe();
             loadPetPage();
@@ -699,20 +704,10 @@ public class PetService extends Service {
 
     /** 彻底换一套窗口 + WebView（渲染进程死后那个 WebView 已经不可用，必须新建）。 */
     private void recreateWindows() {
-        try {
-            removeNow(web);
-            removeNow(touch);
-        } catch (Throwable ignore) {
-        }
-        try {
-            if (web != null) web.destroy();
-        } catch (Throwable ignore) {
-        }
-        web = null;
-        touch = null;
-        lpRender = null;
-        lpTouch = null;
-        actValid = false;
+        if (!running) return;
+        // v6.9：先在主线程同步摘窗（removeViewImmediate），确认摘掉了才 destroy ——
+        // 还挂着的 WebView 被 destroy 会在屏幕上留下最后一帧，就是"两个她"里的那个影子。
+        detachAllWindows(true);
         touchRegionKey = "";
         lastPageAliveAt = 0;
         createWindows();
@@ -770,11 +765,7 @@ public class PetService extends Service {
 
     private void switchMode(boolean want) {
         log("win mode -> " + (want ? "a11y(模式A)" : "board(模式B)"));
-        removeNow(web);
-        removeNow(touch);
-        try { if (web != null) web.destroy(); } catch (Throwable ignore) {}
-        web = null;
-        touch = null;
+        detachAllWindows(true);
         WindowManager aw = want ? PetA11y.wm() : null;
         if (want && aw == null) { // 无障碍刚断开：别硬上，标记本次进程不再试
             a11yBlocked = true;
@@ -796,6 +787,15 @@ public class PetService extends Service {
                 if (gen != a11yGen || !a11yOn) return;
                 if (lastPageAliveAt > 0 && bodyValid) {
                     log("a11y self-check ok (alive, body " + Math.round(bodyRelW) + "x" + Math.round(bodyRelH) + ")");
+                    return;
+                }
+                // v6.9：页面根本没加载成功（DSH 关着 / 3080 没起来）不是"窗口坏了"，
+                // 别因为用户先关 DSH 再开悬浮窗就把整个进程永久降到模式 B —— 重试即可。
+                boolean pageNotLoaded = pageLoads == 0
+                        || (lastError != null && lastError.startsWith("load:"));
+                if (pageNotLoaded) {
+                    log("a11y self-check: page not loaded yet (keep A, retry)");
+                    armA11ySelfCheck();
                     return;
                 }
                 log("a11y self-check FAILED (alive=" + (lastPageAliveAt > 0) + " body=" + bodyValid
@@ -823,7 +823,19 @@ public class PetService extends Service {
      * 所以三个都试一遍：当前 wm、无障碍 wm、系统 wm。
      */
     private void removeNow(View v) {
-        if (v == null) return;
+        detachWindow(v);
+    }
+
+    /**
+     * 摘窗，并告诉调用方"到底摘掉没有"。
+     *
+     * v6.9：返回值很关键 —— 摘失败时**绝对不能**接着 `web.destroy()`。WebView 在
+     * 还挂在窗口上时被 destroy，渲染 surface 会和窗口脱节，屏幕上会留下最后一帧
+     * （用户看到的"一个她静止发虚、一个她在动"）；之后再重建窗口，新的一只叠在旧影子上，
+     * 反复重开就叠成"好几个她"。
+     */
+    private boolean detachWindow(View v) {
+        if (v == null) return true;
         WindowManager[] list = new WindowManager[]{
                 wm, safeA11yWm(), (WindowManager) getSystemService(Context.WINDOW_SERVICE)
         };
@@ -831,16 +843,101 @@ public class PetService extends Service {
             if (m == null) continue;
             try {
                 m.removeViewImmediate(v);
-                return;
+                synchronized (LIVE_WINDOWS) { LIVE_WINDOWS.remove(v); }
+                return true;
             } catch (Throwable ignore) {
             }
             try {
                 m.removeView(v);
-                return;
+                synchronized (LIVE_WINDOWS) { LIVE_WINDOWS.remove(v); }
+                return true;
             } catch (Throwable ignore) {
             }
         }
         log("removeNow: 三个 WindowManager 都摘不掉这块窗（旧的可能还留在屏幕上）");
+        return false;
+    }
+
+    /**
+     * 本进程里由我们加进 WindowManager 的所有窗（含"上一份服务实例"遗留的）。
+     *
+     * static 是有意的：Android 的 Service 被 stop 之后同进程里再 start 是**新实例**，
+     * 旧实例的字段全没了 —— 但它加过的窗如果没摘干净，只有这份进程级清单还认得出来。
+     * v6.9 起 createWindows() 一进来就先按它清一遍，保证"任何路径都不会多出一只"。
+     */
+    private static final java.util.ArrayList<View> LIVE_WINDOWS = new java.util.ArrayList<View>();
+
+    private void addLiveWindow(View v, WindowManager.LayoutParams lp) {
+        wm.addView(v, lp);
+        synchronized (LIVE_WINDOWS) {
+            if (!LIVE_WINDOWS.contains(v)) LIVE_WINDOWS.add(v);
+        }
+    }
+
+    /** 把所有我们加过的窗摘干净；destroyWeb=true 时顺便销毁 WebView（先摘后销毁）。 */
+    private void detachAllWindows(boolean destroyWeb) {
+        WebView w = web;
+        View t = touch;
+        View p = probeView;
+        try {
+            if (w != null) w.stopLoading();
+        } catch (Throwable ignore) {
+        }
+        java.util.ArrayList<View> copy;
+        synchronized (LIVE_WINDOWS) {
+            copy = new java.util.ArrayList<View>(LIVE_WINDOWS);
+        }
+        for (View v : copy) detachWindow(v);
+        detachWindow(w);
+        detachWindow(t);
+        detachWindow(p);
+        synchronized (LIVE_WINDOWS) {
+            // 摘失败的**留在清单里**，下次建窗前再试一次；摘成功的 detachWindow 已经移除了
+            if (!LIVE_WINDOWS.isEmpty()) {
+                log("detachAllWindows: " + LIVE_WINDOWS.size() + " 块窗没摘掉（下次再试）");
+            }
+        }
+        web = null;
+        touch = null;
+        probeView = null;
+        lpRender = null;
+        lpTouch = null;
+        lpProbe = null;
+        actValid = false;
+        touchRegionKey = "";
+        if (destroyWeb && w != null) {
+            android.view.ViewParent parent = null;
+            try {
+                parent = w.getParent();
+            } catch (Throwable ignore) {
+            }
+            if (parent == null) {
+                try {
+                    w.destroy();
+                } catch (Throwable t2) {
+                    log("web destroy failed " + t2);
+                }
+            } else {
+                // 还挂在窗口上就销毁 = 留残影，宁可不销毁（进程结束时系统会收）
+                log("skip web.destroy: still attached");
+            }
+        }
+    }
+
+    /** 本进程的 WindowManagerGlobal.mViews（反射；只是诊断，拿不到就返回 null）。 */
+    @SuppressWarnings("unchecked")
+    private java.util.List<View> globalWindowViews() {
+        try {
+            Class<?> c = Class.forName("android.view.WindowManagerGlobal");
+            java.lang.reflect.Method g = c.getDeclaredMethod("getInstance");
+            g.setAccessible(true);
+            Object inst = g.invoke(null);
+            java.lang.reflect.Field f = c.getDeclaredField("mViews");
+            f.setAccessible(true);
+            return (java.util.List<View>) f.get(inst);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /** 屏幕是不是亮着（熄屏时不做页面健康检查 / 不重载）。 */
@@ -903,11 +1000,11 @@ public class PetService extends Service {
                     lpProbe.x = 40;
                     lpProbe.y = 40;
                     lpProbe.alpha = 1f;
-                    wm.addView(probeView, lpProbe);
+                    addLiveWindow(probeView, lpProbe);
                     log("probe window added");
                 }
             } else if (probeView != null) {
-                wm.removeView(probeView);
+                detachWindow(probeView);
                 probeView = null;
                 lpProbe = null;
                 log("probe window removed");
@@ -918,7 +1015,15 @@ public class PetService extends Service {
     }
 
     private void createWindows() {
+        if (!running) { // 服务已经 destroy 了，别再补窗（延时任务/重试可能晚到）
+            log("createWindows skipped: not running");
+            return;
+        }
         winGen++;
+        // ★ 幂等（v6.9）：不管从 onCreate / 模式切换 / 崩溃重建 / catch 重试哪条路进来，
+        //   先把这一进程里我们加过的窗全部摘干净。以前这里是直接 new WebView + addView，
+        //   一旦某条路径的旧窗没摘掉，就会在屏幕上叠出第二只、第三只。
+        detachAllWindows(true);
         log("createWindows gen=" + winGen + " a11y=" + a11yOn + " area=" + areaW + "x" + areaH + "@" + areaTop);
         try {
             int type = a11yOn
@@ -1035,6 +1140,13 @@ public class PetService extends Service {
                             v.evaluateJavascript(js, null);
                         }
                     });
+                    // 真的是宠物页（有 #root）才显示 —— 错误页没这个节点，保持隐形
+                    v.evaluateJavascript("(document.getElementById('root')?'1':'0')", val -> {
+                        try {
+                            if (v == web && val != null && val.indexOf('1') >= 0) v.setVisibility(View.VISIBLE);
+                        } catch (Throwable ignore) {
+                        }
+                    });
                     main.postDelayed(PetService.this::reportMetrics, 2600);
                 }
 
@@ -1050,6 +1162,10 @@ public class PetService extends Service {
                     if (r != null && r.isForMainFrame()) {
                         lastError = "load: " + e.getDescription() + " " + r.getUrl();
                         log("ERR " + lastError);
+                        // v6.9：主文档加载失败（DSH 关着、3080 没起来）时 WebView 会画一张
+                        // 灰白色的"网页无法打开"。模式 A 下这块窗是整屏的，铺上去就挡住整个屏幕。
+                        // 先藏起来（窗还是透明的），6 秒后重试；真页面回来再显示。
+                        try { v.setVisibility(View.INVISIBLE); } catch (Throwable ignore) {}
                         main.postDelayed(PetService.this::loadPetPage, 6000);
                     }
                 }
@@ -1070,7 +1186,7 @@ public class PetService extends Service {
             lpRender.y = areaTop;
             lpRender.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
             setTrustedFlag(lpRender, winTrusted);
-            wm.addView(web, lpRender);
+            addLiveWindow(web, lpRender);
             installTouchRegion();
             watchTouchRegion();
 
@@ -1079,7 +1195,7 @@ public class PetService extends Service {
             lpTouch = new WindowManager.LayoutParams(1, 1, type, winFlags(false), PixelFormat.TRANSLUCENT);
             lpTouch.gravity = Gravity.TOP | Gravity.LEFT;
             setTrustedFlag(lpTouch, winTrusted);
-            wm.addView(touch, lpTouch);
+            addLiveWindow(touch, lpTouch);
 
             main.postDelayed(this::pollLocation, 120);
             if (a11yOn) armA11ySelfCheck();
@@ -1093,6 +1209,7 @@ public class PetService extends Service {
             if (a11yOn) { // 无障碍窗建不出来（没授权/被拒）→ 立刻退回模式 B，绝不留黑屏
                 a11yBlocked = true;
                 a11yOn = false;
+                detachAllWindows(true); // 已经挂上去的半成品先摘掉，否则回退时就是"两只"
                 wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
                 main.postDelayed(this::createWindows, 800);
             }
@@ -1994,6 +2111,26 @@ public class PetService extends Service {
             pr.put("h", lpProbe == null ? -1 : lpProbe.height);
             pr.put("type", winType);
             o.put("probe", pr);
+            int liveN;
+            synchronized (LIVE_WINDOWS) { liveN = LIVE_WINDOWS.size(); }
+            o.put("liveWindows", liveN);
+            try {
+                java.util.List<View> gv = globalWindowViews();
+                if (gv != null) {
+                    o.put("wmViews", gv.size());
+                    org.json.JSONArray ga = new org.json.JSONArray();
+                    synchronized (gv) {
+                        for (View vw : gv) {
+                            if (vw == null) continue;
+                            String n = vw.getClass().getSimpleName();
+                            try { n += ":" + (vw == web ? "web" : vw == touch ? "touch" : ""); } catch (Throwable ignore) {}
+                            ga.put(n);
+                        }
+                    }
+                    o.put("wmViewList", ga);
+                }
+            } catch (Throwable ignore) {
+            }
             o.put("flags", winFlagSet);
             o.put("page", lastJsInfo);
             JSONArray ls = new JSONArray();
@@ -2077,6 +2214,14 @@ public class PetService extends Service {
                     int i = path.indexOf("js=");
                     String code = i >= 0 ? URLDecoder.decode(path.substring(i + 3), "UTF-8") : "1";
                     body = "{\"ok\":true,\"result\":" + JSONObject.quote(evalJs(code)) + "}";
+                } else if (path.startsWith("/cmd")) {
+                    // 远程维护：/cmd?do=restart / stop / wait（容器里可直接触发，不用手点面板）
+                    String doWhat = "";
+                    int i = path.indexOf("do=");
+                    if (i >= 0) doWhat = path.substring(i + 3).split("&")[0];
+                    if ("restart".equals(doWhat)) main.post(PetService.this::recreateWindows);
+                    else if ("stop".equals(doWhat)) main.post(PetService.this::stopSelf);
+                    body = "{\"ok\":true,\"do\":" + JSONObject.quote(doWhat) + "}";
                 } else {
                     body = dump();
                 }
@@ -2098,18 +2243,10 @@ public class PetService extends Service {
     @Override
     public void onDestroy() {
         running = false;
-        try {
-            if (web != null) {
-                wm.removeView(web);
-                web.destroy();
-                web = null;
-            }
-        } catch (Throwable ignore) {
-        }
-        try {
-            if (touch != null) wm.removeView(touch);
-        } catch (Throwable ignore) {
-        }
+        // v6.9：同步摘窗（三个 WindowManager 都试）→ 确认摘下 → 才 destroy。
+        // 以前这里只 wm.removeView（异步）+ 立刻 web.destroy()，WebView 在"还挂着"的状态被销毁，
+        // surface 会和窗口脱节 → 屏幕上留着她最后一帧；下次打开就叠成两只。
+        detachAllWindows(true);
         log("service destroyed");
         super.onDestroy();
     }
@@ -2121,6 +2258,11 @@ public class PetService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_RESTART.equals(intent.getAction())) {
+            log("onStartCommand: restart requested");
+            // 冷启动时 onCreate 里的首次建窗还排在队列里（winGen 还是 0），别再重复建一次
+            if (main != null && winGen > 0) main.post(this::recreateWindows);
+        }
         return START_STICKY;
     }
 }

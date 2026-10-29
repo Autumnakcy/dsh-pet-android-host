@@ -165,8 +165,17 @@ public class MainActivity extends Activity {
             askOverlay();
             return;
         }
-        if (PetService.isRunning()) stopService(new Intent(this, PetService.class));
         Intent i = new Intent(this, PetService.class);
+        if (PetService.isRunning()) {
+            // v6.9：正在跑 → 让**同一个服务实例**自己重建窗口。
+            // 不再 stopService + startForegroundService 连发（两个请求抢同一个 ServiceRecord，
+            // 旧窗没摘干净新窗就建起来 → 屏幕上多一只）。
+            i.setAction(PetService.ACTION_RESTART);
+            startService(i);
+            toast("正在重启悬浮窗…");
+            ui.postDelayed(this::refresh, 1200);
+            return;
+        }
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
         else startService(i);
         ui.postDelayed(this::refresh, 1600);
