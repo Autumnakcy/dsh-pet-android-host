@@ -38,6 +38,10 @@
   （同一块白：可触摸 255，穿透 208；`lp.alpha` / `View.alpha` 全是 1，压暗不在我们代码里）。
   想要「不透明」就必须「可触摸」——这是默认模型选「可触摸」的根本原因。
 - `TYPE_PHONE(2002)` / `TYPE_SYSTEM_ALERT(2003)` 在 Android 16 对普通 App 直接 `permission denied`。
+- **同一个窗口的 flags 只能有一个算法**：建窗（`createWindows`）和重建（`rebuildRenderWindow`）
+  各写一份 `addFlags`，就会出现「一条路径可触摸、一条路径穿透」——ROM 只压暗穿透那条，
+  用户看到的就是**有概率变透明**。现在两处都调 `renderWindowFlags()`，`/dump` 的 `lpFlags`
+  是唯一可信的验收口径（可触摸 = `16778024`，穿透 = `16778040`）。
 - 全屏普通悬浮窗可能被判成「遮挡」，弹「可能造成部分操作无响应」。
 - `targetSdk 28` 时 `WindowInsets.getInsets()` 走 legacy 口径，**返回全 0**；
   无条件采信会让「状态栏高度」变成 0，宠物能走进状态栏底下。**六个数全 0 就别采信**，退回 `dimen` 口径。

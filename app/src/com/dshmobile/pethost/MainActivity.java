@@ -2,8 +2,11 @@ package com.dshmobile.pethost;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -15,58 +18,121 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * 控制面板（v2.6 重做视觉）。
+ * 控制面板（v6.11：无障碍权限独立成按钮 + 面板可换自定义背景图）。
  *
- * 只做三件事：看状态（权限 / 悬浮窗 / DSH 连接）、起停悬浮窗、给两条备用入口。
+ * 只做四件事：看状态（权限 / 悬浮窗 / DSH 连接）、起停悬浮窗、授权两种权限、换面板背景。
  * 全部用系统控件 + GradientDrawable 手绘，不引第三方库（离线环境装不了依赖）。
+ *
+ * v6.11 两处改动（铭秋哥哥 10-29 要的）：
+ *   ① 无障碍权限从「服务里偷偷跳一次设置页」改成面板上**独立的一个按钮**，
+ *      并且实时显示开没开（读 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES，不需要权限）。
+ *   ② 整个面板支持**用户自定义背景图**：从相册选一张 → 拷进 App 私有目录 → 下次打开还在。
+ *      图片上盖一层压暗（scrim），卡片改成半透明，保证文字依然看得清。
  */
 public class MainActivity extends Activity {
 
     private static final int REQ_CAP = 1001;
     private static final int REQ_STORAGE = 1002;
+    private static final int REQ_PICK_BG = 1003;
 
     private static final int BG = 0xFF0B0D12;
     private static final int CARD = 0xFF161A22;
+    /** 有背景图时的卡片色：半透明，让图片从卡片下面透一点出来 */
+    private static final int CARD_IMG = 0xE0161A22;
+    /** 盖在背景图上的压暗层（60% 黑），不然浅色图片上白字看不清 */
+    private static final int SCRIM = 0x99000000;
     private static final int TEXT = 0xFFEDF1F7;
     private static final int MUTED = 0xFF8A93A6;
     private static final int ACCENT = 0xFF5B8CFF;
+    private static final int A11Y_ACCENT = 0xFF9E8BFF;
     private static final int OK = 0xFF35C77A;
     private static final int WARN = 0xFFE8952F;
     private static final int BAD = 0xFFE5484D;
 
+    /** 背景图存 App 私有目录：拷进来就不怕相册那边撤销授权 / 图片被移走 */
+    private static final String BG_FILE = "panel-bg.img";
+    private static final long BG_MAX_BYTES = 60L * 1024 * 1024;
+
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView chipPerm, chipWindow, chipLink;
+    private TextView a11yState, a11yBtn;
+    private TextView bgState, bgClearBtn;
     private android.widget.Switch bootSwitch;
     private TextView shotInfo;
     private TextView primary, secondary;
     private LinearLayout root;
+    private FrameLayout shell;
+    private int cardColor = CARD;
+    private boolean hasBg = false;
     private volatile boolean linked = false;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        try {
+            getWindow().setBackgroundDrawable(new ColorDrawable(BG));
+        } catch (Throwable ignore) {
+        }
+        buildUi();
+        new Thread(() -> ping("ui opened v8")).start();
+    }
+
+    // ---------------- 界面 ----------------
+
+    /**
+     * 整个界面在这里一次搭完。
+     * 换背景时直接再调一次（旧视图会被 setContentView 整体换掉），
+     * 比 recreate() 干净：不会闪一下、也不会重复跑 ping。
+     */
+    private void buildUi() {
+        Bitmap bgBm = null;
+        File bgf = bgFile();
+        if (bgf.exists() && bgf.length() > 0) bgBm = loadBgBitmap();
+        hasBg = bgBm != null;
+        cardColor = hasBg ? CARD_IMG : CARD;
+
+        shell = new FrameLayout(this);
+        shell.setBackgroundColor(BG);
+
+        if (hasBg) {
+            ImageView bgView = new ImageView(this);
+            bgView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            bgView.setImageBitmap(bgBm);
+            shell.addView(bgView, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            View scrim = new View(this);
+            scrim.setBackgroundColor(SCRIM);
+            shell.addView(scrim, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(BG);
+        root.setBackgroundColor(Color.TRANSPARENT);
         root.setPadding(dp(22), dp(34), dp(22), dp(28));
 
         ScrollView sv = new ScrollView(this);
         sv.setFillViewport(true);
-        sv.setBackgroundColor(BG);
+        sv.setBackgroundColor(Color.TRANSPARENT);
         sv.addView(root, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
-        setContentView(sv);
+        shell.addView(sv, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        setContentView(shell);
 
         // ---- 头部：她本人 + 标题 ----
         LinearLayout head = new LinearLayout(this);
@@ -120,10 +186,31 @@ public class MainActivity extends Activity {
         });
         root.addView(secondary, marginTop(dp(10)));
 
-        // ---- 权限入口 ----
-        TextView perm = ghostButton("授权悬浮窗权限");
-        perm.setOnClickListener(v -> askOverlay());
-        root.addView(perm, marginTop(dp(10)));
+        // ---- 权限：两个独立按钮（v6.11）----
+        // 以前无障碍只在服务里"没开就偷偷跳一次设置页"，用户根本不知道该点哪儿。
+        // 现在它自己占一排按钮 + 一行状态，开了没开一眼看见。
+        LinearLayout permCard = card();
+        permCard.addView(text("权限", 13, MUTED, true));
+
+        a11yBtn = ghostButton("授权无障碍权限");
+        a11yBtn.setTextColor(A11Y_ACCENT);
+        a11yBtn.setOnClickListener(v -> askA11y());
+        permCard.addView(a11yBtn, marginTop(dp(10)));
+
+        a11yState = text("", 11, MUTED, false);
+        a11yState.setPadding(dp(2), dp(8), dp(2), 0);
+        permCard.addView(a11yState);
+
+        TextView a11yHint = text("开了它，窗口才能整块全屏铺开、又不被系统压暗（模式 A）。" +
+                "系统设置 → 已下载的服务 → 「DSH 桌宠悬浮窗」打开即可，只是借窗口权限，不读屏幕。",
+                11, 0xFF5A6273, false);
+        a11yHint.setPadding(dp(2), dp(4), dp(2), 0);
+        permCard.addView(a11yHint);
+
+        TextView overlayBtn = ghostButton("授权悬浮窗权限");
+        overlayBtn.setOnClickListener(v -> askOverlay());
+        permCard.addView(overlayBtn, marginTop(dp(14)));
+        root.addView(permCard, marginTop(dp(14)));
 
         // ---- 自启动（v6.6）----
         // 两层：① 我们自己的「开机自动启动」开关（落盘，BootReceiver 读它）
@@ -144,18 +231,40 @@ public class MainActivity extends Activity {
         bootRow.addView(bootSwitch);
         bootCard.addView(bootRow);
 
-
         TextView bootBtn = ghostButton("打开系统自启动权限");
         bootBtn.setOnClickListener(v -> openAutostart());
-        LinearLayout.LayoutParams blp = marginTop(dp(10));
-        bootCard.addView(bootBtn, blp);
+        bootCard.addView(bootBtn, marginTop(dp(10)));
         root.addView(bootCard, marginTop(dp(14)));
+
+        // ---- 面板背景图（v6.11）----
+        LinearLayout bgCard = card();
+        LinearLayout bgRow = new LinearLayout(this);
+        bgRow.setOrientation(LinearLayout.HORIZONTAL);
+        bgRow.setGravity(Gravity.CENTER_VERTICAL);
+        bgRow.addView(text("面板背景", 14, TEXT, false), new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        bgState = text(hasBg ? "自定义" : "默认深色", 12, hasBg ? A11Y_ACCENT : MUTED, false);
+        bgRow.addView(bgState);
+        bgCard.addView(bgRow);
+
+        TextView bgPick = ghostButton("从相册选一张图片");
+        bgPick.setOnClickListener(v -> pickBackground());
+        bgCard.addView(bgPick, marginTop(dp(10)));
+
+        bgClearBtn = ghostButton("恢复默认背景");
+        bgClearBtn.setAlpha(hasBg ? 1f : 0.45f);
+        bgClearBtn.setEnabled(hasBg);
+        bgClearBtn.setOnClickListener(v -> clearBackground());
+        bgCard.addView(bgClearBtn, marginTop(dp(8)));
+
+        TextView bgHint = text("图片会铺满整个面板，并自动压暗一层保证文字看得清；" +
+                "只存在本机 App 里，不上传。", 11, 0xFF5A6273, false);
+        bgHint.setPadding(dp(2), dp(8), dp(2), 0);
+        bgCard.addView(bgHint);
+        root.addView(bgCard, marginTop(dp(14)));
 
         // 截屏诊断/浏览器试跑/玩法说明已去掉：界面只留真正要用的
         shotInfo = text("", 11, 0xFF5A6273, false);
-
-
-        new Thread(() -> ping("ui opened v7")).start();
     }
 
     // ---------------- 交互 ----------------
@@ -191,6 +300,185 @@ public class MainActivity extends Activity {
                 startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION));
             } catch (Throwable ignore) {
             }
+        }
+    }
+
+    /**
+     * 无障碍权限按钮（v6.11）。
+     *
+     * 现实：无障碍服务**只能用户自己在系统设置里打开**，App 没有 API 能替用户开
+     * （这是 Android 的安全边界，绕不过去）。所以这个按钮做的是把那一页打开，
+     * 并在面板上实时显示到底开没开——不用再猜。
+     */
+    private void askA11y() {
+        if (a11yEnabled()) {
+            toast("已开启。要关掉的话，在这里把「DSH 桌宠悬浮窗」的开关关掉");
+        } else {
+            toast("在「已下载的服务」里找到「DSH 桌宠悬浮窗」，打开开关");
+        }
+        try {
+            Intent i = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+            new Thread(() -> ping("open a11y settings")).start();
+        } catch (Throwable t) {
+            try {
+                startActivity(new Intent(Settings.ACTION_SETTINGS));
+            } catch (Throwable ignore) {
+                toast("打不开系统设置，请手动去：设置 → 无障碍");
+            }
+        }
+    }
+
+    /** 无障碍服务到底开没开：先看本进程里服务活没活，再看系统那份已启用列表。 */
+    private boolean a11yEnabled() {
+        if (PetA11y.isReady()) return true;
+        try {
+            String s = Settings.Secure.getString(getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            if (s == null || s.length() == 0) return false;
+            String want = getPackageName() + "/" + PetA11y.class.getName();
+            for (String p : s.split(":")) {
+                if (p.equalsIgnoreCase(want)) return true;
+            }
+        } catch (Throwable ignore) {
+        }
+        return false;
+    }
+
+    // ---------------- 背景图 ----------------
+
+    private File bgFile() {
+        return new File(getFilesDir(), BG_FILE);
+    }
+
+    /**
+     * 解码背景图。按屏幕宽度做 2 的幂降采样，RGB_565 省内存——
+     * 背景图只需要"铺满"，不需要原图精度，几千万像素的相机照直接塞进 ImageView 会 OOM。
+     */
+    private Bitmap loadBgBitmap() {
+        File f = bgFile();
+        if (!f.exists() || f.length() == 0) return null;
+        try {
+            BitmapFactory.Options probe = new BitmapFactory.Options();
+            probe.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getAbsolutePath(), probe);
+            int w = probe.outWidth;
+            if (w <= 0) return null;
+            int limit = Math.max(1080, getResources().getDisplayMetrics().widthPixels);
+            int sample = 1;
+            while (w / sample > limit * 2 && sample < 16) sample *= 2;
+            BitmapFactory.Options opt = new BitmapFactory.Options();
+            opt.inSampleSize = sample;
+            opt.inPreferredConfig = Bitmap.Config.RGB_565;
+            return BitmapFactory.decodeFile(f.getAbsolutePath(), opt);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private void pickBackground() {
+        try {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("image/*");
+            startActivityForResult(i, REQ_PICK_BG);
+        } catch (Throwable t) {
+            try {
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("image/*");
+                startActivityForResult(i, REQ_PICK_BG);
+            } catch (Throwable t2) {
+                toast("没找到能选图片的应用");
+            }
+        }
+    }
+
+    /**
+     * 选完图：拷进 App 私有目录（不长期持有 content:// 授权，相册删了/撤销了也不怕），
+     * 解码验证能打开才替换，然后重建界面。
+     */
+    private void importBackground(final Uri uri) {
+        toast("正在读取这张图…");
+        new Thread(() -> {
+            boolean ok = false;
+            File tmp = new File(getFilesDir(), BG_FILE + ".tmp");
+            try {
+                InputStream in = getContentResolver().openInputStream(uri);
+                if (in != null) {
+                    OutputStream out = new FileOutputStream(tmp);
+                    byte[] buf = new byte[16 * 1024];
+                    long total = 0;
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        total += n;
+                        if (total > BG_MAX_BYTES) break;
+                        out.write(buf, 0, n);
+                    }
+                    out.flush();
+                    out.close();
+                    in.close();
+                    if (total > 0 && total <= BG_MAX_BYTES) {
+                        File dst = bgFile();
+                        if (dst.exists() && !dst.delete()) {
+                            // 删不掉就用新文件覆盖，交给下一步验证
+                        }
+                        ok = tmp.renameTo(dst);
+                        if (!ok) {
+                            // 某些文件系统上跨目录 rename 会失败，退一步整体复制
+                            ok = copyFile(tmp, dst);
+                        }
+                    }
+                }
+            } catch (Throwable ignore) {
+            }
+            if (tmp.exists()) tmp.delete();
+            if (ok) {
+                // 能解码才算成功，坏图直接丢掉，别让面板变成空白
+                ok = loadBgBitmap() != null;
+                if (!ok) {
+                    File dst = bgFile();
+                    if (dst.exists()) dst.delete();
+                }
+            }
+            final boolean res = ok;
+            ui.post(() -> {
+                if (res) {
+                    buildUi();
+                    refresh();
+                    toast("背景换好啦");
+                    new Thread(() -> ping("bg set")).start();
+                } else {
+                    toast("这张图没读进来，换一张试试");
+                }
+            });
+        }, "bg-import").start();
+    }
+
+    private boolean copyFile(File src, File dst) {
+        try {
+            InputStream in = new java.io.FileInputStream(src);
+            OutputStream out = new FileOutputStream(dst);
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.close();
+            in.close();
+            return dst.length() > 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void clearBackground() {
+        File f = bgFile();
+        if (f.exists() && f.delete()) {
+            buildUi();
+            refresh();
+            toast("已恢复默认深色背景");
+        } else {
+            toast("本来就没有自定义背景");
         }
     }
 
@@ -272,6 +560,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if (req == REQ_PICK_BG) {
+            if (res != RESULT_OK || data == null || data.getData() == null) return;
+            importBackground(data.getData());
+            return;
+        }
         if (req == REQ_CAP) {
             if (res != RESULT_OK || data == null) {
                 shotInfo.setText("已取消截屏");
@@ -342,9 +635,16 @@ public class MainActivity extends Activity {
     private void refresh() {
         boolean perm = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this);
         boolean run = PetService.isRunning();
+        boolean a11y = a11yEnabled();
         paint(chipPerm, perm ? "权限 已给" : "权限 未给", perm ? OK : BAD);
         paint(chipWindow, run ? "悬浮窗 开" : "悬浮窗 关", run ? OK : WARN);
         paint(chipLink, linked ? "DSH 在线" : "DSH 离线", linked ? OK : BAD);
+        if (a11yState != null) {
+            paint(a11yState, a11y ? "状态：已开启 ✓" : "状态：未开启", a11y ? OK : WARN);
+        }
+        if (a11yBtn != null) {
+            a11yBtn.setText(a11y ? "无障碍已开启 · 去系统设置看看" : "授权无障碍权限");
+        }
         primary.setText(run ? "重启悬浮窗" : "打开悬浮窗");
         secondary.setAlpha(run ? 1f : 0.45f);
         secondary.setEnabled(run);
@@ -384,7 +684,7 @@ public class MainActivity extends Activity {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
         c.setPadding(dp(16), dp(16), dp(16), dp(16));
-        c.setBackground(round(CARD, 18, 0));
+        c.setBackground(round(cardColor, 18, 0));
         return c;
     }
 

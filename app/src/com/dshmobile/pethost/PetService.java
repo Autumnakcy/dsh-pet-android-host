@@ -74,7 +74,7 @@ public class PetService extends Service {
      *  旧窗还没摘完新窗就建 —— 正是"关掉再打开就多一只"的来源之一。 */
     static final String ACTION_RESTART = "com.dshmobile.pethost.action.RESTART";
     /** 打进 /report 里，用来确认手机装的是哪一版 */
-    private static final String APP_VER = "6.9";
+    private static final String APP_VER = "6.11";
     /** 页面静默多久就 reload / 重建窗口（2.8 的同款阈值，实测能区分"发呆"和"渲染进程死了"） */
     private static final long SILENT_RELOAD_MS = 60000;
     private static final long SILENT_RECREATE_MS = 180000;
@@ -562,6 +562,56 @@ public class PetService extends Service {
         }
     }
 
+    /**
+     * 渲染窗的 flags —— **建窗和重建窗必须用同一份**（v6.10）。
+     *
+     * 以前 createWindows() 在模式 B 里写死 `winFlags(true)`（穿透），而 rebuildRenderWindow()
+     * 才按 winFlagSet 建。结果：每次「开悬浮窗 / 关掉再开 / 重启」建出来的都是穿透窗，
+     * 这台 ROM 会在**合成端**把穿透的 APPLICATION_OVERLAY 压到 208/255≈81%，
+     * 页面里 `video/root/body` 的 opacity 全是 1、像素 alpha 全是 255 —— 用户看到的就是
+     * 「她有概率透明」。只有调参触发的 rebuild 才会变回不透明的 touchable 窗。
+     *
+     * 现在两条路共用这份：模式 B 默认 touchable（=不透明），穿透只由 winFlagSet 显式指定。
+     */
+    private int renderWindowFlags() {
+        if (a11yOn) {
+            // 模式 A：全屏显示窗永远穿透（无障碍层不会被压暗），触摸全归触摸窗
+            return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        }
+        if ("touchThenPass".equals(winFlagSet)) {
+            // 先按"可触摸"建窗（ROM 对穿透窗会压 alpha），建完再翻回穿透
+            return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        }
+        if ("touchable".equals(winFlagSet)) {
+            // 可触摸版：某些 ROM 会给"点击穿透"的悬浮窗压 alpha
+            return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        }
+        if ("minimal".equals(winFlagSet)) {
+            return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        }
+        if ("noNoLimits".equals(winFlagSet)) {
+            return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        }
+        return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+    }
+
     /** 按当前 win* 参数重建渲染窗（触摸窗一并重建，保证层级在上面）。 */
     private void rebuildRenderWindow() {
         if (web == null) return;
@@ -572,40 +622,7 @@ public class PetService extends Service {
         detachWindow(probeView);
         try {
             int type = winTypeInt();
-            int f;
-            if (a11yOn) {
-                // 模式 A：全屏显示窗永远穿透（无障碍层不会被压暗），触摸全归触摸窗
-                f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-            } else if ("touchThenPass".equals(winFlagSet)) {
-                // 先按"可触摸"建窗（ROM 对穿透窗会压 alpha），建完再翻回穿透
-                f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
-            } else if ("touchable".equals(winFlagSet)) {
-                // 可触摸版：某些 ROM 会给"点击穿透"的悬浮窗压 alpha
-                f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
-            } else if ("minimal".equals(winFlagSet)) {
-                f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-            } else if ("noNoLimits".equals(winFlagSet)) {
-                f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-            } else {
-                f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-            }
+            int f = renderWindowFlags();
             if (winHw) f |= WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
             // ★ 窗口固定铺满整个工作区，永不改变大小：她只在这个固定坐标系里移动。
             //   菜单放不放得下改由「可触摸区域」决定，不再靠改窗口大小（改窗口会有 2~3 帧错位 → 回弹）。
@@ -676,6 +693,13 @@ public class PetService extends Service {
                 try {
                     if (!running) return;
                     long now = System.currentTimeMillis();
+                    // v6.10：web 为空的实例（服务已被收掉、窗还挂在系统上）没有"页面"可判活，
+                    // 每 60s 刷一句 "silent -> reload page" 只是噪音，还会误导排查。
+                    if (web == null) {
+                        lastPageAliveAt = now;
+                        main.postDelayed(this, WATCH_MS);
+                        return;
+                    }
                     // 屏幕关着的时候她本来就看不见，WebView 也可能被系统挂起 —— 这时候去 reload
                     // 只会白白重建页面（回来时正好撞上"旧画面还在、新页面还没画"的那一刻）。
                     if (!screenOn()) {
@@ -836,25 +860,62 @@ public class PetService extends Service {
      */
     private boolean detachWindow(View v) {
         if (v == null) return true;
+        // v6.10：先看 parent。已经不在窗口上的视图，removeViewImmediate 会抛
+        // IllegalArgumentException（"View not attached to window manager"），
+        // 以前被 catch 吞掉后当成"摘不掉"，LIVE_WINDOWS 里留一堆僵尸条目，
+        // 日志每轮刷"三个 WindowManager 都摘不掉"——其实屏幕上早就没有它了。
+        try {
+            if (v.getParent() == null) {
+                synchronized (LIVE_WINDOWS) { LIVE_WINDOWS.remove(v); }
+                return true;
+            }
+        } catch (Throwable ignore) {
+        }
         WindowManager[] list = new WindowManager[]{
                 wm, safeA11yWm(), (WindowManager) getSystemService(Context.WINDOW_SERVICE)
         };
+        Throwable last = null;
         for (WindowManager m : list) {
             if (m == null) continue;
             try {
                 m.removeViewImmediate(v);
                 synchronized (LIVE_WINDOWS) { LIVE_WINDOWS.remove(v); }
                 return true;
-            } catch (Throwable ignore) {
+            } catch (Throwable e) {
+                last = e;
             }
             try {
                 m.removeView(v);
                 synchronized (LIVE_WINDOWS) { LIVE_WINDOWS.remove(v); }
                 return true;
-            } catch (Throwable ignore) {
+            } catch (Throwable e) {
+                last = e;
             }
         }
-        log("removeNow: 三个 WindowManager 都摘不掉这块窗（旧的可能还留在屏幕上）");
+        // 最后一道：直接找进程级的 WindowManagerGlobal。它认得 mViews 里的每一个视图，
+        // 不受"这块窗当初是哪个 Context 加的"影响 —— 模式切换/服务重建后最容易卡在这。
+        try {
+            Class<?> c = Class.forName("android.view.WindowManagerGlobal");
+            java.lang.reflect.Method g = c.getDeclaredMethod("getInstance");
+            g.setAccessible(true);
+            Object inst = g.invoke(null);
+            java.lang.reflect.Method rm = c.getMethod("removeView", View.class, boolean.class);
+            rm.invoke(inst, v, true);
+            synchronized (LIVE_WINDOWS) { LIVE_WINDOWS.remove(v); }
+            log("removeNow: 走 WindowManagerGlobal 兜底摘掉了");
+            return true;
+        } catch (Throwable e) {
+            last = e;
+        }
+        try {
+            if (v.getParent() == null) {
+                synchronized (LIVE_WINDOWS) { LIVE_WINDOWS.remove(v); }
+                return true;
+            }
+        } catch (Throwable ignore) {
+        }
+        log("removeNow: 三个 WindowManager 都摘不掉这块窗（"
+                + v.getClass().getSimpleName() + "）：" + last);
         return false;
     }
 
@@ -1173,11 +1234,12 @@ public class PetService extends Service {
 
             // ★ 窗口固定铺满整个工作区（见 rebuildRenderWindow 的说明）
             // 模式 A：显示窗从一开始就是「整块工作区 + 只读」；模式 B：8×8 起，由页面撑开
+            // v6.10：flags 一律走 renderWindowFlags()，别在这里写死 winFlags(true) ——
+            //        那条路建出来的穿透窗会被 ROM 压到 81% alpha，用户看到就是"她透明了"。
             lpRender = a11yOn
                     ? new WindowManager.LayoutParams(areaW, areaH, type,
-                        winFlags(true) | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-                        PixelFormat.TRANSLUCENT)
-                    : new WindowManager.LayoutParams(8, 8, type, winFlags(true), PixelFormat.TRANSLUCENT);
+                        renderWindowFlags(), PixelFormat.TRANSLUCENT)
+                    : new WindowManager.LayoutParams(8, 8, type, renderWindowFlags(), PixelFormat.TRANSLUCENT);
             lpRender.gravity = Gravity.TOP | Gravity.LEFT;
             lpRender.alpha = (float) winWinAlpha;
             lpRender.dimAmount = 0f;

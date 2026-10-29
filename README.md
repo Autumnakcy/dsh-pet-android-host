@@ -5,7 +5,7 @@
 这个仓库只做最难也最脏的那一层 —— **窗口、触摸、坐标**。
 
 - 包名 `com.dshmobile.pethost`
-- 版本 **6.9**（versionCode 44）
+- 版本 **6.11**（versionCode 46）
 - 无 Gradle、无第三方依赖，一个 `build.sh` 直接出 APK
 - 在 OxygenOS/ColorOS + Android 16 上验证
 
@@ -22,6 +22,7 @@
 | 对话 | 界面是页面里的原版 dsh-pet 弹窗；键盘由**透明 Activity** 托住（悬浮窗拿不到 IME），输入经桥回灌 |
 | 横竖屏 | `onConfigurationChanged` 重读屏幕/系统栏尺寸，经 `applyDeskGeometry()` + `relayout()` 热推给页面，不重载 |
 | 自启动 | `BOOT_COMPLETED` 接收器 + 控制面板开关；ROM 那层「自启动权限」由用户手动开（系统不提供读写 API） |
+| 面板 | 原生控制面板：权限状态实时显示、一键跳授权；背景图从相册选（拷进 App 私有目录，60% 压暗层 + 半透明卡片保证白字可读） |
 
 ## 两种窗口模型
 
@@ -41,7 +42,7 @@ app/AndroidManifest.xml         minSdk 28 / targetSdk 28
 app/src/com/dshmobile/pethost/
   PetService.java               核心：两个悬浮窗、Bridge、几何、调参循环、横竖屏
   PetA11y.java                  模式 A 的无障碍服务（只借窗口权限）
-  MainActivity.java             控制面板（开关/权限入口/自启动）
+  MainActivity.java             控制面板（开关/权限状态/自定义背景/自启动）
   ChatInputActivity.java        隐形输入代理（2dp 透明 Activity，托住输入法）
   BootReceiver.java / Boot.java 开机自启动 + 开关落盘
   Shot.java                     截屏诊断（可选）
@@ -91,6 +92,20 @@ bash build.sh
 
 - 带 `FLAG_NOT_TOUCHABLE` 的 `TYPE_APPLICATION_OVERLAY` 窗口在 ColorOS 上会被压暗约 19%
   （所以默认模型是「可触摸、不透明」）；
+- **无障碍服务不能由 App 自己打开**——只能跳设置页让用户点，所以面板做的是「跳对的那一页 + 回显状态」；
+- 从相册选来的 `content://` 授权不能长期持有（撤销/重启就失效），**要立刻把字节拷进自己的私有目录**再解码；
+- 大图必须先 `inJustDecodeBounds` 量尺寸、按 2 的幂降采样 + `RGB_565` 再解码，几千万像素的相机原图直接 `decodeStream` 会 OOM；
 - `targetSdk 28` 时 `WindowInsets.getInsets()` 走 legacy 口径、**返回全 0**，别直接采信；
 - WebView 的 `::-webkit-media-controls-*` 伪元素必须**一条规则一条**写，逗号列表里有一个不识别，整条会被静默丢弃；
 - `element.textContent` 会把 `display:none` 的文字也算进去，判等要取标题那一段。
+
+## 更新日志
+
+- **6.11** 控制面板：无障碍权限独立成一个按钮（跳对的那一页 + 实时回显开关状态）；
+  面板背景可换成相册里的图（存 App 私有目录，60% 压暗 + 半透明卡片）。
+- **6.10** 修「有概率变透明」：建窗与重建共用 `renderWindowFlags()`，模式 B 恒为可触摸；
+  「三个 WindowManager 都摘不掉」的日志刷屏也一起治了。
+- **6.9** 修「关掉再打开就多一只 / 叠着静止影子」；面板「重启悬浮窗」改走同实例 `recreateWindows()`。
+- **6.7 / 6.8** 修「有时两个她 / 有时半透明」；模式 A 自检不再因页面没加载误降级到模式 B。
+- **6.6** 首个公开版本：透明 Activity 托住输入法、横竖屏热切换、开机自启动。
+- 更早的 6.1–6.5 见 git 历史与 Release 说明。

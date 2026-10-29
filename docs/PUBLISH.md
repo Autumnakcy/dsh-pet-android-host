@@ -15,7 +15,7 @@
 ## A. 电脑上 git（推荐）
 
 ### 1. 把源码拿到电脑
-手机上的位置：`/sdcard/dsh/pethost-src-6.6.zip`（约 224 KB）。
+手机上的位置：`/sdcard/dsh/pethost-src-6.11.zip`（约 236 KB）。
 用数据线（MTP）、手机助手、局域网共享（SMB/Feishu 自己发给自己）都行，拷到电脑后解压。
 
 ### 2. 初始化并提交
