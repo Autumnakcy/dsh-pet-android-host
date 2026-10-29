@@ -94,3 +94,9 @@ bash build.sh
 - `targetSdk 28` 时 `WindowInsets.getInsets()` 走 legacy 口径、**返回全 0**，别直接采信；
 - WebView 的 `::-webkit-media-controls-*` 伪元素必须**一条规则一条**写，逗号列表里有一个不识别，整条会被静默丢弃；
 - `element.textContent` 会把 `display:none` 的文字也算进去，判等要取标题那一段。
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 Autumnakcy
