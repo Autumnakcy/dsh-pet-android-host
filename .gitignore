@@ -1,0 +1,19 @@
+# 构建产物
+out/
+*.apk
+*.aab
+*.zip
+
+# 签名私钥：绝对不要提交（公开仓库里出现 = 谁都能拿它签名冒充你）
+keystore.jks
+*.jks
+*.keystore
+
+# 本地 SDK / 工具 jar（体积大，且各人路径不同）
+dl/
+
+# 编辑器 / 系统垃圾
+.DS_Store
+.idea/
+*.iml
+*.swp

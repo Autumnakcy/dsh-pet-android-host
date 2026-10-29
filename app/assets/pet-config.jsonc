@@ -1,0 +1,46 @@
+{
+  "pets": [
+    {
+      "id": "main",
+      "name": "蓝色大肥鱼",
+      "size": 300,
+      "balanceEnabled": true,
+      "whisperEnabled": true,
+      "workStatusEnabled": true,
+      "fixedEnabled": false,
+      "display": "desktop",
+      "position": {
+        "corner": "top-right",
+        "marginX": 24,
+        "marginY": 100
+      }
+    }
+  ],
+  "notificationsEnabled": true,
+  "whisperImageEnabled": true,
+  "chatImageEnabled": true,
+  "confineToScreen": false,
+  "physics": {
+    "gravity": 1400,
+    "restitution": 0.78,
+    "groundFriction": 2.5,
+    "ceilingBounce": true,
+    "throwPower": 1,
+    "petCollision": false
+  },
+  "font": {
+    "family": "candy",
+    "size": 21,
+    "followPet": true
+  },
+  "whisperModel": {
+    "provider": "",
+    "model": ""
+  },
+  "chatModel": {
+    "provider": "",
+    "model": ""
+  },
+  "chatMemoryRounds": 5,
+  "chatImageLimit": 10
+}

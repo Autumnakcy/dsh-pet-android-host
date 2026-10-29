@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DSH 桌宠悬浮窗</string>
+    <string name="a11y_desc">仅用于给桌宠窗口授权（无障碍悬浮层）。不读取屏幕内容，不监听任何事件。</string>
+</resources>
